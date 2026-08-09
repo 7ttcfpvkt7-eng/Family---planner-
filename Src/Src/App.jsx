@@ -20,7 +20,10 @@ const SUBJECT_COLORS = {
   REVIEW: '#8C8570',
   'SOC ST': '#A16E4B',
   SCIENCE: '#4A7C82',
+  OTHER: '#6B6558',
 };
+
+const ASSIGN_SUBJECTS = ['ELA', 'MATH', 'IXL', 'HISTORY', 'SOC ST', 'SCIENCE', 'OTHER'];
 
 function initials(name) {
   return name.trim().split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
@@ -30,14 +33,13 @@ function fmtDateLong(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
   return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
 }
-
 // ============================================================
 // Auth screen — one shared family login
 // ============================================================
 function AuthScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
+  const [mode, setMode] = useState('signin');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -103,11 +105,16 @@ function Planner({ session }) {
   const [completion, setCompletion] = useState({});
   const [notes, setNotes] = useState({});
   const [noteDraft, setNoteDraft] = useState('');
+  const [overrides, setOverrides] = useState({});
+  const [customAssignments, setCustomAssignments] = useState([]);
   const [loadingStudents, setLoadingStudents] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState('');
   const [newGrade, setNewGrade] = useState('');
   const [syncError, setSyncError] = useState(false);
+  const [editTarget, setEditTarget] = useState(null); // { itemKey, currentTitle, currentLink, hasLink }
+  const [showAddAssignment, setShowAddAssignment] = useState(false);
+  const [newAssign, setNewAssign] = useState({ subject: 'OTHER', title: '', link: '', notes: '' });
   const noteSaveTimer = useRef(null);
 
   const active = students.find(s => s.id === activeId) || students[0];
@@ -117,7 +124,6 @@ function Planner({ session }) {
   const mathLessons = schedule.mathLessons || {};
   const totalHistoryDays = schedule.totalHistoryDays || 0;
 
-  // ---- Load students from Supabase ----
   useEffect(() => {
     (async () => {
       const { data, error } = await supabase.from('students').select('*').order('created_at', { ascending: true });
@@ -128,15 +134,16 @@ function Planner({ session }) {
     })();
   }, []);
 
-  // ---- Load completions + notes for the active student, and subscribe to live changes ----
   useEffect(() => {
     if (!activeId) return;
     let cancelled = false;
 
     (async () => {
-      const [{ data: comp }, { data: noteRows }] = await Promise.all([
+      const [{ data: comp }, { data: noteRows }, { data: ovRows }, { data: caRows }] = await Promise.all([
         supabase.from('completions').select('item_key, done').eq('student_id', activeId),
         supabase.from('notes').select('date, body').eq('student_id', activeId),
+        supabase.from('overrides').select('item_key, field, value').eq('student_id', activeId),
+        supabase.from('custom_assignments').select('*').eq('student_id', activeId),
       ]);
       if (cancelled) return;
       const compMap = {};
@@ -145,6 +152,10 @@ function Planner({ session }) {
       const noteMap = {};
       (noteRows || []).forEach(r => { noteMap[r.date] = r.body; });
       setNotes(noteMap);
+      const ovMap = {};
+      (ovRows || []).forEach(r => { ovMap[`${r.item_key}|${r.field}`] = r.value; });
+      setOverrides(ovMap);
+      setCustomAssignments(caRows || []);
     })();
 
     const channel = supabase
@@ -159,12 +170,24 @@ function Planner({ session }) {
         if (!row) return;
         setNotes(prev => ({ ...prev, [row.date]: payload.new ? payload.new.body : '' }));
       })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'overrides', filter: `student_id=eq.${activeId}` }, (payload) => {
+        const row = payload.new || payload.old;
+        if (!row) return;
+        const key = `${row.item_key}|${row.field}`;
+        setOverrides(prev => {
+          const next = { ...prev };
+          if (payload.new) next[key] = payload.new.value; else delete next[key];
+          return next;
+        });
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'custom_assignments', filter: `student_id=eq.${activeId}` }, () => {
+        supabase.from('custom_assignments').select('*').eq('student_id', activeId).then(({ data }) => setCustomAssignments(data || []));
+      })
       .subscribe();
 
     return () => { cancelled = true; supabase.removeChannel(channel); };
   }, [activeId]);
 
-  // ---- Toggle a checkbox (writes straight to Supabase; realtime updates local + other devices) ----
   const toggleItem = async (dateStr, key) => {
     const itemKey = `${dateStr}|${key}`;
     const fullKey = `${activeId}::${itemKey}`;
@@ -177,7 +200,6 @@ function Planner({ session }) {
     if (error) setSyncError(true);
   };
 
-  // ---- Jump to today on student switch / load ----
   useEffect(() => {
     if (!days.length) { setDayIndex(0); return; }
     const todayStr = new Date().toISOString().slice(0, 10);
@@ -202,6 +224,48 @@ function Planner({ session }) {
       );
       if (error) setSyncError(true);
     }, 600);
+  };
+
+  const saveOverride = async (itemKey, field, value) => {
+    setOverrides(prev => ({ ...prev, [`${itemKey}|${field}`]: value }));
+    const { error } = await supabase.from('overrides').upsert(
+      { student_id: activeId, item_key: itemKey, field, value, updated_at: new Date().toISOString() },
+      { onConflict: 'student_id,item_key,field' }
+    );
+    if (error) setSyncError(true);
+  };
+
+  const submitEdit = async () => {
+    if (!editTarget) return;
+    await saveOverride(editTarget.itemKey, 'title', editTarget.currentTitle);
+    if (editTarget.hasLink) await saveOverride(editTarget.itemKey, 'link', editTarget.currentLink);
+    setEditTarget(null);
+  };
+
+  const addAssignment = async () => {
+    if (!newAssign.title.trim() || !currentDay) return;
+    const row = {
+      student_id: activeId,
+      date: currentDay.date,
+      subject: newAssign.subject,
+      title: newAssign.title.trim(),
+      link: newAssign.link.trim() || null,
+      notes: newAssign.notes.trim() || null,
+    };
+    const { error } = await supabase.from('custom_assignments').insert(row).select();
+    if (error) { setSyncError(true); return; }
+    setNewAssign({ subject: 'OTHER', title: '', link: '', notes: '' });
+    setShowAddAssignment(false);
+  };
+
+  const deleteAssignment = async (id) => {
+    const { error } = await supabase.from('custom_assignments').delete().eq('id', id);
+    if (error) setSyncError(true);
+  };
+
+  const moveAssignment = async (id, newDate) => {
+    const { error } = await supabase.from('custom_assignments').update({ date: newDate }).eq('id', id);
+    if (error) setSyncError(true);
   };
 
   const progress = useMemo(() => {
@@ -248,6 +312,8 @@ function Planner({ session }) {
   };
 
   const signOut = async () => { await supabase.auth.signOut(); };
+
+  const dayCustomAssignments = currentDay ? customAssignments.filter(c => c.date === currentDay.date) : [];
 
   if (loadingStudents) {
     return <div className="planner-root" style={{ alignItems: 'center', justifyContent: 'center' }}><style>{globalStyles}</style><div className="date-sub font-mono">Loading…</div></div>;
@@ -313,8 +379,27 @@ function Planner({ session }) {
             </div>
 
             <div className="cards">
-              {currentDay && renderDayCards(currentDay, elaLessons, mathLessons, totalHistoryDays, completion, toggleItem, activeId)}
+              {currentDay && renderDayCards(currentDay, elaLessons, mathLessons, totalHistoryDays, completion, toggleItem, activeId, overrides, setEditTarget)}
+              {dayCustomAssignments.map(ca => (
+                <div key={ca.id} className={`card ${completion[`${activeId}::${currentDay.date}|CUSTOM${ca.id}`] ? 'done' : ''}`} style={{ borderLeftColor: SUBJECT_COLORS[ca.subject] || SUBJECT_COLORS.OTHER }}>
+                  <div className="checkbox" onClick={() => toggleItem(currentDay.date, `CUSTOM${ca.id}`)} style={completion[`${activeId}::${currentDay.date}|CUSTOM${ca.id}`] ? { background: SUBJECT_COLORS[ca.subject] || SUBJECT_COLORS.OTHER, borderColor: SUBJECT_COLORS[ca.subject] || SUBJECT_COLORS.OTHER } : {}}>
+                    {completion[`${activeId}::${currentDay.date}|CUSTOM${ca.id}`] ? '\u2713' : ''}
+                  </div>
+                  <div className="card-body">
+                    <div className="card-label" style={{ color: SUBJECT_COLORS[ca.subject] || SUBJECT_COLORS.OTHER }}>{ca.subject} · Custom</div>
+                    <div className="card-title">{ca.title}</div>
+                    {ca.notes && <div className="card-sub">{ca.notes}</div>}
+                    {ca.link && <a className="ixl-link" href={ca.link} target="_blank" rel="noopener noreferrer">Open Link &#8599;</a>}
+                    <div className="custom-actions">
+                      <button className="icon-btn" onClick={() => { const nd = prompt('Move to date (YYYY-MM-DD):', ca.date); if (nd) moveAssignment(ca.id, nd); }}>Move</button>
+                      <button className="icon-btn danger" onClick={() => deleteAssignment(ca.id)}>Delete</button>
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
+
+            <button className="add-assignment-btn" onClick={() => setShowAddAssignment(true)}>+ Add Assignment</button>
 
             <div className="notes-block">
               <div className="notes-label font-display">Notes for this day</div>
@@ -344,13 +429,61 @@ function Planner({ session }) {
           </div>
         </div>
       )}
+
+      {editTarget && (
+        <div className="modal-overlay" onClick={() => setEditTarget(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h3 className="font-display">Edit Item</h3>
+            <input
+              placeholder="Title"
+              value={editTarget.currentTitle}
+              onChange={e => setEditTarget(prev => ({ ...prev, currentTitle: e.target.value }))}
+              autoFocus
+            />
+            {editTarget.hasLink && (
+              <input
+                placeholder="Link (URL)"
+                value={editTarget.currentLink}
+                onChange={e => setEditTarget(prev => ({ ...prev, currentLink: e.target.value }))}
+              />
+            )}
+            <div className="modal-actions">
+              <button className="btn-secondary" onClick={() => setEditTarget(null)}>Cancel</button>
+              <button className="btn-primary" onClick={submitEdit}>Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAddAssignment && (
+        <div className="modal-overlay" onClick={() => setShowAddAssignment(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h3 className="font-display">Add Assignment</h3>
+            <select
+              className="modal-select"
+              value={newAssign.subject}
+              onChange={e => setNewAssign(prev => ({ ...prev, subject: e.target.value }))}
+            >
+              {ASSIGN_SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+            <input placeholder="Title" value={newAssign.title} onChange={e => setNewAssign(prev => ({ ...prev, title: e.target.value }))} autoFocus />
+            <input placeholder="Link (optional)" value={newAssign.link} onChange={e => setNewAssign(prev => ({ ...prev, link: e.target.value }))} />
+            <input placeholder="Notes (optional)" value={newAssign.notes} onChange={e => setNewAssign(prev => ({ ...prev, notes: e.target.value }))} />
+            <div className="modal-actions">
+              <button className="btn-secondary" onClick={() => setShowAddAssignment(false)}>Cancel</button>
+              <button className="btn-primary" onClick={addAssignment}>Add</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function renderDayCards(day, elaLessons, mathLessons, totalHistoryDays, completion, toggleItem, activeId) {
+function renderDayCards(day, elaLessons, mathLessons, totalHistoryDays, completion, toggleItem, activeId, overrides, setEditTarget) {
   const cards = [];
   const isDone = (key) => !!completion[`${activeId}::${day.date}|${key}`];
+  const ov = (itemKey, field, fallback) => overrides[`${itemKey}|${field}`] ?? fallback;
 
   const Check = ({ checked, onClick, color }) => (
     <div className="checkbox" onClick={onClick} style={checked ? { background: color, borderColor: color } : {}}>
@@ -358,9 +491,17 @@ function renderDayCards(day, elaLessons, mathLessons, totalHistoryDays, completi
     </div>
   );
 
+  const EditBtn = ({ onClick }) => (
+    <button className="edit-btn" onClick={onClick} aria-label="Edit">&#9998;</button>
+  );
+
   if (day.lesson) {
     const ela = elaLessons[String(day.lesson)];
     const math = mathLessons[String(day.lesson)];
+    const elaKey = `${day.date}|ELA`;
+    const elaTitleDefault = `Good and the Beautiful Language Arts — Lesson ${day.lesson}${ela && ela.title ? `: ${ela.title}` : ''}`;
+    const elaTitle = ov(elaKey, 'title', elaTitleDefault);
+
     cards.push(
       <div key="ela" className={`card ${isDone('ELA') ? 'done' : ''}`} style={{ borderLeftColor: SUBJECT_COLORS.ELA }}>
         <Check checked={isDone('ELA')} onClick={() => toggleItem(day.date, 'ELA')} color={SUBJECT_COLORS.ELA} />
@@ -369,26 +510,30 @@ function renderDayCards(day, elaLessons, mathLessons, totalHistoryDays, completi
             ELA
             {ela && ela.project && <span className="pill" style={{ background: '#F3E9F6', color: SUBJECT_COLORS.IXL }}>Project Lesson</span>}
           </div>
-          <div className="card-title">
-            Good and the Beautiful Language Arts — Lesson {day.lesson}
-            {ela && ela.title ? `: ${ela.title}` : ''}
-          </div>
+          <div className="card-title">{elaTitle}</div>
           {ela && (ela.unit || ela.part) && (
             <div className="card-sub">
               {ela.unit ? `Unit ${ela.unit}` : ''}{ela.unit && ela.part ? ' \u00b7 ' : ''}{ela.part ? `Course Book Part ${ela.part}` : ''}
             </div>
           )}
         </div>
+        <EditBtn onClick={() => setEditTarget({ itemKey: elaKey, currentTitle: elaTitle, currentLink: '', hasLink: false })} />
       </div>
     );
+
+    const mathKey = `${day.date}|MATH`;
+    const mathTitleDefault = `Lesson ${day.lesson}${math ? `: ${math}` : ''}`;
+    const mathTitle = ov(mathKey, 'title', mathTitleDefault);
+
     cards.push(
       <div key="math" className={`card ${isDone('MATH') ? 'done' : ''}`} style={{ borderLeftColor: SUBJECT_COLORS.MATH }}>
         <Check checked={isDone('MATH')} onClick={() => toggleItem(day.date, 'MATH')} color={SUBJECT_COLORS.MATH} />
         <div className="card-body">
           <div className="card-label" style={{ color: SUBJECT_COLORS.MATH }}>Math</div>
-          <div className="card-title">Lesson {day.lesson}{math ? `: ${math}` : ''}</div>
+          <div className="card-title">{mathTitle}</div>
           <div className="card-sub">+ Mental Math Mysteries — Lesson {day.lesson}</div>
         </div>
+        <EditBtn onClick={() => setEditTarget({ itemKey: mathKey, currentTitle: mathTitle, currentLink: '', hasLink: false })} />
       </div>
     );
   } else if (day.review) {
@@ -405,29 +550,37 @@ function renderDayCards(day, elaLessons, mathLessons, totalHistoryDays, completi
 
   (day.ixl || []).forEach((item, i) => {
     const key = `IXL${i}`;
+    const itemKey = `${day.date}|${key}`;
+    const title = ov(itemKey, 'title', item.code);
+    const link = ov(itemKey, 'link', item.link);
     cards.push(
       <div key={key} className={`card ${isDone(key) ? 'done' : ''}`} style={{ borderLeftColor: SUBJECT_COLORS.IXL }}>
         <Check checked={isDone(key)} onClick={() => toggleItem(day.date, key)} color={SUBJECT_COLORS.IXL} />
         <div className="card-body">
           <div className="card-label" style={{ color: SUBJECT_COLORS.IXL }}>IXL &middot; {item.subject}</div>
-          <div className="card-title font-mono" style={{ fontSize: 13 }}>{item.code}</div>
-          <a className="ixl-link" href={item.link} target="_blank" rel="noopener noreferrer">
+          <div className="card-title font-mono" style={{ fontSize: 13 }}>{title}</div>
+          <a className="ixl-link" href={link} target="_blank" rel="noopener noreferrer">
             Open IXL &#8599;
           </a>
         </div>
+        <EditBtn onClick={() => setEditTarget({ itemKey, currentTitle: title, currentLink: link, hasLink: true })} />
       </div>
     );
   });
 
   if (day.history) {
+    const historyKey = `${day.date}|HISTORY`;
+    const historyTitleDefault = `Beautiful Feet — Reading Day ${day.history} of ${totalHistoryDays}`;
+    const historyTitle = ov(historyKey, 'title', historyTitleDefault);
     cards.push(
       <div key="history" className={`card ${isDone('HISTORY') ? 'done' : ''}`} style={{ borderLeftColor: SUBJECT_COLORS.HISTORY }}>
         <Check checked={isDone('HISTORY')} onClick={() => toggleItem(day.date, 'HISTORY')} color={SUBJECT_COLORS.HISTORY} />
         <div className="card-body">
           <div className="card-label" style={{ color: SUBJECT_COLORS.HISTORY }}>History</div>
-          <div className="card-title">Beautiful Feet — Reading Day {day.history} of {totalHistoryDays}</div>
+          <div className="card-title">{historyTitle}</div>
           <div className="card-sub">Use your physical book/guide for today's reading</div>
         </div>
+        <EditBtn onClick={() => setEditTarget({ itemKey: historyKey, currentTitle: historyTitle, currentLink: '', hasLink: false })} />
       </div>
     );
   }
@@ -447,7 +600,7 @@ function renderDayCards(day, elaLessons, mathLessons, totalHistoryDays, completi
 // Top-level App — decides Auth vs Planner
 // ============================================================
 export default function App() {
-  const [session, setSession] = useState(undefined); // undefined = loading, null = signed out
+  const [session, setSession] = useState(undefined);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -465,7 +618,7 @@ export default function App() {
 }
 
 // ============================================================
-// Shared styles (design preserved exactly from the original artifact)
+// Shared styles
 // ============================================================
 const globalStyles = `
   @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Karla:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
@@ -582,12 +735,30 @@ const globalStyles = `
   .modal-overlay { position: fixed; inset: 0; background: rgba(43,42,37,0.4); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
   .modal { background: white; border-radius: 16px; padding: 28px; width: 100%; max-width: 320px; box-shadow: 0 20px 50px rgba(0,0,0,0.25); }
   .modal h3 { font-size: 19px; margin-bottom: 16px; }
-  .modal input { width: 100%; padding: 10px 12px; border-radius: 9px; border: 1.5px solid #DCD2B8; font-family: 'Karla', sans-serif; font-size: 14px; margin-bottom: 12px; }
-  .modal input:focus { outline: 2px solid #4C7A5B; border-color: transparent; }
+  .modal input, .modal-select { width: 100%; padding: 10px 12px; border-radius: 9px; border: 1.5px solid #DCD2B8; font-family: 'Karla', sans-serif; font-size: 14px; margin-bottom: 12px; background: white; }
+  .modal input:focus, .modal-select:focus { outline: 2px solid #4C7A5B; border-color: transparent; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
   .btn-secondary { background: #EAE3D2; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-family: 'Karla', sans-serif; font-weight: 600; font-size: 13px; }
   .btn-primary { background: #2B2A25; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-family: 'Karla', sans-serif; font-weight: 600; font-size: 13px; }
   .save-warning { font-size: 11px; color: #B9863A; margin-top: 14px; font-family: 'IBM Plex Mono', monospace; }
+
+  .edit-btn {
+    background: transparent; border: none; cursor: pointer; font-size: 15px; color: #B9AF95;
+    padding: 4px; align-self: flex-start; flex-shrink: 0;
+  }
+  .edit-btn:hover { color: #6B6558; }
+  .custom-actions { display: flex; gap: 10px; margin-top: 8px; }
+  .icon-btn {
+    background: transparent; border: 1px solid #DCD2B8; border-radius: 6px; padding: 4px 10px;
+    font-size: 11px; cursor: pointer; color: #6B6558; font-family: 'Karla', sans-serif;
+  }
+  .icon-btn.danger { color: #C1554D; border-color: #E8C9C4; }
+  .add-assignment-btn {
+    display: block; width: 100%; margin-top: 14px; padding: 12px; border-radius: 12px;
+    border: 2px dashed #B9AF95; background: transparent; color: #6B6558; font-family: 'Karla', sans-serif;
+    font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  .add-assignment-btn:hover { background: #EAE3D2; }
 
   @media (max-width: 640px) {
     .main { padding: 20px 16px 50px; max-width: 100%; }
@@ -599,3 +770,7 @@ const globalStyles = `
     .sync-pill { display: none; }
   }
 `;
+
+
+
+      
