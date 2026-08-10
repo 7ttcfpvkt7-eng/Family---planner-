@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { supabase } from './supabaseClient.js';import confetti from 'canvas-confetti';
-
+import { supabase } from './supabaseClient.js';
+import confetti from 'canvas-confetti';
 import PENELOPE_SCHEDULE from './data/penelopeSchedule.json';
 import AUBREY_SCHEDULE from './data/aubreySchedule.json';
 
@@ -113,8 +113,8 @@ function Planner({ session }) {
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState('');
   const [newGrade, setNewGrade] = useState('');
-  const [syncError, setSyncError] = useState(false);  const [showCelebration, setShowCelebration] = useState(false);
-
+  const [syncError, setSyncError] = useState(false);
+  const [showCelebration, setShowCelebration] = useState(false);
   const [editTarget, setEditTarget] = useState(null);
   const [showAddAssignment, setShowAddAssignment] = useState(false);
   const [newAssign, setNewAssign] = useState({ subject: 'OTHER', title: '', link: '', notes: '' });
@@ -191,7 +191,7 @@ function Planner({ session }) {
     return () => { cancelled = true; supabase.removeChannel(channel); };
   }, [activeId]);
 
-    const toggleItem = async (dateStr, key) => {
+  const toggleItem = async (dateStr, key) => {
     const itemKey = `${dateStr}|${key}`;
     const fullKey = `${activeId}::${itemKey}`;
     const nextDone = !completion[fullKey];
@@ -223,7 +223,6 @@ function Planner({ session }) {
     });
     setTimeout(() => setShowCelebration(false), 2600);
   };
-
 
   useEffect(() => {
     if (!days.length) { setDayIndex(0); return; }
@@ -371,12 +370,12 @@ function Planner({ session }) {
             <div className="header-name font-display">{active ? `${active.name}'s Planner` : 'Planner'}</div>
             {active?.grade && <div className="header-grade">{active.grade}</div>}
           </div>
-          <div className="sync-pill font-mono">{session.user.email}</div>          {showCelebration && (
+          <div className="sync-pill font-mono">{session.user.email}</div>
+          {showCelebration && (
             <div className="celebration-banner font-display">
               🎉 Great job today! 🎉
             </div>
           )}
-
         </div>
 
         {days.length > 0 && (
@@ -701,7 +700,8 @@ const globalStyles = `
   .main { flex: 1; padding: 32px 40px 60px; max-width: 780px; }
   .header-name { font-size: 28px; font-weight: 600; }
   .header-grade { font-size: 14px; color: #6B6558; margin-top: 2px; }
-  .sync-pill { font-size: 10.5px; color: #8C8570; background: #EAE3D2; padding: 5px 10px; border-radius: 100px; margin-top: 4px; }  .celebration-banner {
+  .sync-pill { font-size: 10.5px; color: #8C8570; background: #EAE3D2; padding: 5px 10px; border-radius: 100px; margin-top: 4px; }
+  .celebration-banner {
     position: fixed; top: 24px; left: 50%; transform: translateX(-50%);
     background: #2B2A25; color: white; padding: 12px 24px; border-radius: 100px;
     font-size: 16px; font-weight: 600; box-shadow: 0 10px 30px rgba(0,0,0,0.25);
@@ -711,7 +711,6 @@ const globalStyles = `
     0% { opacity: 0; transform: translateX(-50%) translateY(-10px) scale(0.9); }
     100% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
   }
-
 
   .progress-wrap { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
   .progress-bar-bg { flex: 1; height: 8px; background: #E4DCC8; border-radius: 5px; overflow: hidden; }
